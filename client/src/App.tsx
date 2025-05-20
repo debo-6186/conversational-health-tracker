@@ -1,35 +1,16 @@
-import React, { useRef } from 'react';
-import { Layout, Typography } from 'antd';
-import VoiceChat, { VoiceChatRef } from './components/VoiceChat';
-
-const { Header, Content } = Layout;
-const { Title } = Typography;
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import LandingPage from './components/LandingPage';
+import MedicalHistory from './components/MedicalHistory';
 
 const App: React.FC = () => {
-  // In a real app, this would come from your authentication system
-  const userId = 'user123';
-  const serverUrl = process.env.REACT_APP_SERVER_URL || 'http://localhost:8000';
-  
-  const voiceChatRef = useRef<VoiceChatRef>(null);
-
   return (
-    <Layout style={{ minHeight: '100vh' }}>
-      <Header style={{ background: '#fff', padding: '0 20px' }}>
-        <Title level={3} style={{ margin: '16px 0' }}>
-          Voice Chat with AI Assistant
-        </Title>
-      </Header>
-      <Content style={{ padding: '50px', textAlign: 'center' }}>
-        <VoiceChat 
-          ref={voiceChatRef}
-          userId={userId} 
-          serverUrl={serverUrl}
-          onIncomingCall={() => {
-            console.log('Incoming call started');
-          }}
-        />
-      </Content>
-    </Layout>
+    <Router>
+      <Routes>
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/medical-history" element={<MedicalHistory />} />
+      </Routes>
+    </Router>
   );
 };
 

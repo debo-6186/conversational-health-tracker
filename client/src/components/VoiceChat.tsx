@@ -27,13 +27,21 @@ interface VoiceChatProps {
   userId: string;
   serverUrl: string;
   onIncomingCall?: () => void;
+  initialFirstMessage?: string;
+  initialSystemPrompt?: string;
 }
 
 export interface VoiceChatRef {
-  startIncomingCall: () => Promise<void>;
+  startIncomingCall: (firstMessage?: string, systemPrompt?: string) => Promise<void>;
 }
 
-const VoiceChat = forwardRef<VoiceChatRef, VoiceChatProps>(({ userId, serverUrl, onIncomingCall }, ref) => {
+const VoiceChat = forwardRef<VoiceChatRef, VoiceChatProps>(({ 
+  userId, 
+  serverUrl, 
+  onIncomingCall,
+  initialFirstMessage,
+  initialSystemPrompt 
+}, ref) => {
   log.info(`Initializing VoiceChat component for user: ${userId}, server: ${serverUrl}`);
   
   const [isCallActive, setIsCallActive] = useState(false);
@@ -52,9 +60,9 @@ const VoiceChat = forwardRef<VoiceChatRef, VoiceChatProps>(({ userId, serverUrl,
 
   // Expose methods to parent component
   useImperativeHandle(ref, () => ({
-    startIncomingCall: async () => {
+    startIncomingCall: async (firstMessage?: string, systemPrompt?: string) => {
       if (notificationHandlerRef.current) {
-        await notificationHandlerRef.current.handleIncomingNotification();
+        await notificationHandlerRef.current.handleIncomingNotification(firstMessage, systemPrompt);
       }
     }
   }));
@@ -168,8 +176,9 @@ const VoiceChat = forwardRef<VoiceChatRef, VoiceChatProps>(({ userId, serverUrl,
   };
 
   // Function to handle accepted call
-  const handleCallAccepted = async (conversationId: string) => {
+  const handleCallAccepted = async (conversationId: string, firstMessage?: string, systemPrompt?: string) => {
     log.info(`Call accepted with conversation ID: ${conversationId}`);
+    log.info(`First message: ${firstMessage}, System prompt: ${systemPrompt}`);
     setConversationId(conversationId);
     
     // Start the call with the provided conversation ID
@@ -501,6 +510,8 @@ const VoiceChat = forwardRef<VoiceChatRef, VoiceChatProps>(({ userId, serverUrl,
         },
         body: JSON.stringify({
           user_id: userId,
+          first_message: initialFirstMessage,
+          system_prompt: initialSystemPrompt
         }),
       });
       

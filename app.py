@@ -34,7 +34,6 @@ app.add_middleware(
 # ElevenLabs credentials and setup
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 
 # Initialize ElevenLabs client
 elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
@@ -49,8 +48,7 @@ notification_connections: Dict[str, WebSocket] = {}
 class InitiateCallRequest(BaseModel):
     user_id: str
     agent_id: Optional[str] = None
-    voice_id: Optional[str] = None
-    first_message: Optional[str] = "Hello! I am your husband. How can I help you today?"
+    first_message: Optional[str] = "Hello! I am your caregiver. How can I help you today?"
     language: Optional[str] = "en"
 
 # Add new request model for notification
@@ -58,6 +56,8 @@ class NotificationRequest(BaseModel):
     user_id: str
     notification_title: str = "Incoming Call"
     notification_body: str = "You have an incoming call. Click to answer."
+    first_message: Optional[str] = None
+    system_prompt: Optional[str] = None
 
 @app.post("/initiate-call")
 async def initiate_call(request: InitiateCallRequest):
@@ -69,7 +69,6 @@ async def initiate_call(request: InitiateCallRequest):
     try:
         user_id = request.user_id
         agent_id = request.agent_id or ELEVENLABS_AGENT_ID
-        voice_id = request.voice_id or ELEVENLABS_VOICE_ID
         
         app_logger.info(f"Requesting signed URL from ElevenLabs for agent_id: {agent_id}")
         # Get a signed URL from ElevenLabs API - this creates a conversation
@@ -109,7 +108,6 @@ async def initiate_call(request: InitiateCallRequest):
         active_conversations[conversation_id] = {
             "user_id": user_id,
             "agent_id": agent_id,
-            "voice_id": voice_id,
             "first_message": request.first_message,
             "language": request.language,
             "status": "pending",
@@ -143,19 +141,22 @@ async def trigger_notification(request: NotificationRequest):
     """
     app_logger.info(f"Received notification request for user_id: {request.user_id}")
     app_logger.info(f"Request details - title: {request.notification_title}, body: {request.notification_body}")
+    app_logger.info(f"First message: {request.first_message}, System prompt: {request.system_prompt}")
     
     try:
         # Create a unique notification ID
         notification_id = f"notif_{request.user_id}_{int(time.time())}"
         app_logger.info(f"Generated notification_id: {notification_id}")
         
-        # Store notification information
+        # Store notification information with all request data
         active_conversations[notification_id] = {
             "user_id": request.user_id,
-            "agent_id": "agent_01jvgsbc33f9gsaba915mkfgsh",  # Specific agent for incoming calls
+            "agent_id": "agent_01jvpfa5y5f89vf3fq2wrh9mwe",  # Specific agent for incoming calls
             "status": "pending_notification",
             "notification_title": request.notification_title,
             "notification_body": request.notification_body,
+            "first_message": request.first_message,  # Store the original first_message
+            "system_prompt": request.system_prompt,  # Store the original system_prompt
             "created_at": time.time(),
             "websocket": None
         }
@@ -168,6 +169,8 @@ async def trigger_notification(request: NotificationRequest):
             "notification_id": notification_id,
             "title": request.notification_title,
             "body": request.notification_body,
+            "first_message": request.first_message,
+            "system_prompt": request.system_prompt,
             "status": "pending_notification"
         }
         
@@ -188,6 +191,8 @@ async def trigger_notification(request: NotificationRequest):
                 "notification_id": notification_id,
                 "title": request.notification_title,
                 "body": request.notification_body,
+                "first_message": request.first_message,
+                "system_prompt": request.system_prompt,
                 "status": "pending_notification"
             },
             status_code=200
@@ -239,11 +244,13 @@ async def accept_notification(notification_id: str):
             if not conversation_id:
                 conversation_id = f"conv_{conversation['user_id']}_{conversation['agent_id']}"
             
-            # Update conversation information
+            # Update conversation information, preserving the original first_message and system_prompt
             conversation.update({
                 "status": "pending",
                 "signed_url": signed_url,
-                "conversation_id": conversation_id
+                "conversation_id": conversation_id,
+                "first_message": conversation.get("first_message"),  # Use stored first_message
+                "system_prompt": conversation.get("system_prompt")   # Use stored system_prompt
             })
             
             # Move to new conversation ID
@@ -251,12 +258,16 @@ async def accept_notification(notification_id: str):
             active_conversations.pop(notification_id)
             
             app_logger.info(f"Converted notification {notification_id} to conversation {conversation_id}")
+            app_logger.info(f"Using stored first_message: {conversation.get('first_message')}")
+            app_logger.info(f"Using stored system_prompt: {conversation.get('system_prompt')}")
             
             return JSONResponse(
                 content={
                     "success": True,
                     "conversation_id": conversation_id,
-                    "status": "pending"
+                    "status": "pending",
+                    "first_message": conversation.get("first_message"),  # Include in response
+                    "system_prompt": conversation.get("system_prompt")   # Include in response
                 },
                 status_code=200
             )
@@ -296,33 +307,23 @@ async def websocket_endpoint(websocket: WebSocket, conversation_id: str):
         async with websockets.connect(signed_url) as elevenlabs_ws:
             app_logger.info("Successfully connected to ElevenLabs WebSocket")
             
-            # Set up client config with proper format - IMPORTANT! This must follow exact schema
+            # Set up client config with proper format
             init_config = {
                 "type": "conversation_initiation_client_data",
                 "conversation_config_override": {
                     "agent": {
-                        "first_message": conversation.get("first_message", "Hello! I am your husband. How can I help you today?"),
+                        "first_message": (
+                            conversation.get("first_message") or 
+                            conversation.get("default_first_message", "Hello! I am your caregiver. How can I help you today?")
+                        ),
                         "start_conversation_immediately": True,
-                        "tools": [
-                            {
-                                "type": "system",
-                                "system_tool_type": "transfer_to_agent",
-                                "description": "Transfer the conversation to a specialized agent when specific conditions are met. Use this when the user's query needs expert handling in a particular domain.",
-                                "transfer_rules": [
-                                    {
-                                        "agent_id": "agent_01jvm5sm64e7yrcqfvqccsynzd",
-                                        "condition": "1) When user has questions about medicine or her pregnancy 2) When husband asks user to check with doctor Arijit biswas"
-                                    },
-                                    {
-                                        "agent_id": "agent_01jvgsbc33f9gsaba915mkfgsh",
-                                        "condition": "When user wants to speak to husband"
-                                    }
-                                ]
-                            }
-                        ]
                     }
                 }
             }
+            
+            # Add system prompt if it exists
+            if conversation.get("system_prompt"):
+                init_config["conversation_config_override"]["agent"]["system_prompt"] = conversation["system_prompt"]
             
             app_logger.info(f"Sending initialization config to ElevenLabs: {json.dumps(init_config)}")
             await elevenlabs_ws.send(json.dumps(init_config))

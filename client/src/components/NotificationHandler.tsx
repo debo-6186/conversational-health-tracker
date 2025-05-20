@@ -12,14 +12,23 @@ const log = {
   }
 };
 
+interface NotificationData {
+  notification_id: string;
+  title: string;
+  body: string;
+  first_message?: string;
+  system_prompt?: string;
+  status: string;
+}
+
 interface NotificationHandlerProps {
   userId: string;
   serverUrl: string;
-  onCallAccepted: (conversationId: string) => void;
+  onCallAccepted: (conversationId: string, firstMessage?: string, systemPrompt?: string) => void;
 }
 
 export interface NotificationHandlerRef {
-  handleIncomingNotification: () => Promise<void>;
+  handleIncomingNotification: (firstMessage?: string, systemPrompt?: string) => Promise<void>;
   testNotification: () => Promise<void>;
 }
 
@@ -173,7 +182,7 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
       }
     };
 
-    const showNotification = async (notificationId: string, title: string, body: string) => {
+    const showNotification = async (notificationId: string, title: string, body: string, firstMessage?: string, systemPrompt?: string) => {
       // Stop any existing notification
       if (notificationKeyRef.current) {
         notification.destroy(notificationKeyRef.current);
@@ -218,8 +227,12 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
                 notification.destroy(key);
                 notificationKeyRef.current = null;
 
-                // Notify parent component about accepted call
-                onCallAccepted(data.conversation_id);
+                // Use the first_message and system_prompt from the server response
+                onCallAccepted(
+                  data.conversation_id,
+                  data.first_message || firstMessage,  // Use server response first, then fallback to notification data
+                  data.system_prompt || systemPrompt    // Use server response first, then fallback to notification data
+                );
               } catch (error) {
                 log.error('Error accepting notification:', error);
                 notification.error({
@@ -245,13 +258,13 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
       // Set up interval to keep showing notification if it's closed
       notificationIntervalRef.current = setInterval(() => {
         if (!document.querySelector(`.ant-notification-notice-${key}`)) {
-          showNotification(notificationId, title, body);
+          showNotification(notificationId, title, body, firstMessage, systemPrompt);
         }
       }, 1000);
     };
 
     // Function to handle incoming notifications
-    const handleIncomingNotification = async () => {
+    const handleIncomingNotification = async (firstMessage?: string, systemPrompt?: string) => {
       log.info('Starting to handle incoming notification');
       try {
         log.info(`Sending request to ${serverUrl}/trigger-notification`);
@@ -264,6 +277,8 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
             user_id: userId,
             notification_title: 'Incoming Call',
             notification_body: 'You have an incoming call. Click to answer.',
+            first_message: firstMessage || 'Hello! I am your caregiver. How can I help you today?',
+            system_prompt: systemPrompt || 'You are a caring and attentive caregiver. Your role is to help the patient with their daily needs and health concerns.'
           }),
         });
         
@@ -276,10 +291,15 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
         }
 
         log.info(`Showing notification with ID: ${data.notification_id}`);
-        showNotification(data.notification_id, data.title, data.body);
+        showNotification(
+          data.notification_id, 
+          data.title, 
+          data.body,
+          data.first_message,
+          data.system_prompt
+        );
       } catch (error) {
         log.error('Error handling incoming notification:', error);
-        // Show error notification to user
         notification.error({
           message: 'Notification Error',
           description: 'Failed to trigger notification. Please try again.',
