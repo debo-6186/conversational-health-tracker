@@ -1,0 +1,11 @@
+fastapi==0.109.2
+uvicorn==0.27.1
+python-dotenv==1.0.1
+websockets==12.0
+elevenlabs
+pydantic==2.6.1
+python-multipart==0.0.9
+twilio==8.12.0
+requests==2.31.0
+python-socketio==5.11.1 
+numpy
