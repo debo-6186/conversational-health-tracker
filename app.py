@@ -13,8 +13,9 @@ import websockets
 import httpx
 from elevenlabs.client import ElevenLabs
 import time
-from logger import app_logger, websocket_logger, elevenlabs_logger
+from logger import app_logger
 import numpy as np
+from database import db
 
 # Load environment variables
 load_dotenv()
@@ -69,7 +70,8 @@ async def initiate_call(request: InitiateCallRequest):
     try:
         user_id = request.user_id
         agent_id = request.agent_id or ELEVENLABS_AGENT_ID
-        
+        conversation_id = None  # Initialize conversation_id
+
         app_logger.info(f"Requesting signed URL from ElevenLabs for agent_id: {agent_id}")
         # Get a signed URL from ElevenLabs API - this creates a conversation
         async with httpx.AsyncClient() as client:
@@ -92,7 +94,6 @@ async def initiate_call(request: InitiateCallRequest):
             
             # Extract conversation_id from the signed URL
             url_parts = signed_url.split("&")
-            conversation_id = None
             for part in url_parts:
                 if part.startswith("conversation_id="):
                     conversation_id = part.split("=")[1]
@@ -100,9 +101,29 @@ async def initiate_call(request: InitiateCallRequest):
             
             if not conversation_id:
                 app_logger.warning("Conversation ID not found in URL, generating temporary ID")
-                conversation_id = f"conv_{user_id}_{agent_id}"
+                conversation_id = f"conv_{user_id}_{int(time.time())}"
             else:
                 app_logger.info(f"Extracted conversation_id from URL: {conversation_id}")
+
+        # Store in database
+        try:
+            db.store_conversation(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                conversation_details={
+                    "status": "initiated",
+                    "agent_id": agent_id,
+                    "first_message": request.first_message,
+                    "started_at": time.time()
+                }
+            )
+            app_logger.info(f"Successfully stored conversation {conversation_id} in database")
+        except Exception as e:
+            app_logger.error(f"Failed to store conversation {conversation_id} in database: {e}")
+            return JSONResponse(
+                content={"error": "Failed to store conversation details"},
+                status_code=500
+            )
         
         # Store conversation information
         active_conversations[conversation_id] = {
@@ -132,6 +153,28 @@ async def initiate_call(request: InitiateCallRequest):
             content={"error": str(e)},
             status_code=500
         )
+    
+@app.get("/conversations/{user_id}")
+async def get_conversation_history(user_id: str):
+    """
+    Get conversation history for a user.
+    """
+    try:
+        app_logger.info(f"Fetching conversations for user: {user_id}")
+        conversations = db.get_user_conversations(user_id=user_id)
+        return JSONResponse(
+            content={
+                "success": True,
+                "conversations": conversations
+            },
+            status_code=200
+        )
+    except Exception as e:
+        app_logger.error(f"Error retrieving conversation history: {str(e)}")
+        return JSONResponse(
+            content={"error": str(e)},
+            status_code=500
+        )
 
 @app.post("/trigger-notification")
 async def trigger_notification(request: NotificationRequest):
@@ -151,7 +194,7 @@ async def trigger_notification(request: NotificationRequest):
         # Store notification information with all request data
         active_conversations[notification_id] = {
             "user_id": request.user_id,
-            "agent_id": "agent_01jvpfa5y5f89vf3fq2wrh9mwe",  # Specific agent for incoming calls
+            "agent_id": "agent_01jvvkzxr3e54rre8hjq5rxban",  # Specific agent for incoming calls
             "status": "pending_notification",
             "notification_title": request.notification_title,
             "notification_body": request.notification_body,
@@ -214,6 +257,7 @@ async def accept_notification(notification_id: str):
         raise HTTPException(status_code=404, detail="Notification not found")
     
     conversation = active_conversations[notification_id]
+    app_logger.info(f"Processing conversation: {conversation}")
     if conversation["status"] != "pending_notification":
         raise HTTPException(status_code=400, detail="Notification already processed")
     

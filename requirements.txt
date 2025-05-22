@@ -9,3 +9,4 @@ twilio==8.12.0
 requests==2.31.0
 python-socketio==5.11.1 
 numpy
+mysql-connector-python==8.3.0

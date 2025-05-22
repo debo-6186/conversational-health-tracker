@@ -87,7 +87,13 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
               if (data.type === 'connection_established') {
                 log.info('Connection established message received:', data.message);
               } else if (data.type === 'notification') {
-                showNotification(data.notification_id, data.title, data.body);
+                showNotification(
+                  data.notification_id, 
+                  data.title, 
+                  data.body,
+                  data.first_message,  // Pass first_message from notification
+                  data.system_prompt   // Pass system_prompt from notification
+                );
               }
             } catch (error) {
               log.error('Error processing WebSocket message:', error);
@@ -227,11 +233,11 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
                 notification.destroy(key);
                 notificationKeyRef.current = null;
 
-                // Use the first_message and system_prompt from the server response
+                // Pass the first_message and system_prompt to onCallAccepted
                 onCallAccepted(
                   data.conversation_id,
-                  data.first_message || firstMessage,  // Use server response first, then fallback to notification data
-                  data.system_prompt || systemPrompt    // Use server response first, then fallback to notification data
+                  firstMessage || data.first_message,  // Use notification data first, then fallback to server response
+                  systemPrompt || data.system_prompt    // Use notification data first, then fallback to server response
                 );
               } catch (error) {
                 log.error('Error accepting notification:', error);

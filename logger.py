@@ -63,15 +63,11 @@ def setup_logger(name: str, log_level: int = logging.INFO) -> logging.Logger:
 
 # Create and export all loggers
 app_logger = setup_logger('app')
-websocket_logger = setup_logger('websocket')
-elevenlabs_logger = setup_logger('elevenlabs')
 
 # Example usage:
 if __name__ == "__main__":
     # Test the loggers
     app_logger.info("Application logger initialized")
-    websocket_logger.debug("WebSocket logger initialized")
-    elevenlabs_logger.warning("ElevenLabs logger initialized")
     
     # Test log rotation
     for i in range(1000):
