@@ -135,14 +135,191 @@ async def initiate_call(request: InitiateCallRequest):
             status_code=500
         )
     
+async def analyze_transcript_with_claude(transcript: list, agent_id: str, evaluation_criteria: dict) -> dict:
+    """
+    Analyze conversation transcript using Claude 3.7 Sonnet.
+    
+    Args:
+        transcript: List of conversation turns with role and message
+        agent_id: The agent ID for context
+        evaluation_criteria: The evaluation criteria from platform settings
+        
+    Returns:
+        dict: Analysis results from Claude
+    """
+    try:
+        # First get agent details
+        async with httpx.AsyncClient() as client:
+            agent_response = await client.get(
+                f"https://api.elevenlabs.io/v1/convai/agents/{agent_id}",
+                headers={"xi-api-key": ELEVENLABS_API_KEY}
+            )
+            
+            if agent_response.status_code != 200:
+                raise Exception(f"Failed to get agent details: {agent_response.text}")
+            
+            agent_data = agent_response.json()
+            
+            # Extract evaluation criteria from platform settings
+            criteria = agent_data.get('platform_settings', {}).get('evaluation', {}).get('criteria', [])
+            
+            # Prepare the prompt for Claude
+            criteria_prompts = "\n".join([
+                f"- {c.get('name')}: {c.get('conversation_goal_prompt')}"
+                for c in criteria
+            ])
+            
+            # Format transcript for analysis
+            formatted_transcript = "\n".join([
+                f"{turn['role'].upper()}: {turn['message']}"
+                for turn in transcript
+            ])
+            
+            # Prepare the analysis request to Claude
+            analysis_prompt = f"""You are an expert conversation analyst. Analyze the following conversation between a user and an AI agent (ID: {agent_id}).
+
+Evaluation Criteria:
+{criteria_prompts}
+
+Conversation Transcript:
+{formatted_transcript}
+
+Please analyze this conversation based on the evaluation criteria above. For each criterion:
+1. Determine if the goal was met (success/failure)
+2. Provide a clear rationale for your assessment
+3. Note any specific examples from the conversation that support your assessment
+
+Format your response as a JSON object with the following structure:
+{{
+    "analysis": {{
+        "criteria_results": [
+            {{
+                "criterion_name": "name of criterion",
+                "result": "success/failure",
+                "rationale": "detailed explanation",
+                "supporting_evidence": ["specific examples from conversation"]
+            }}
+        ],
+        "overall_assessment": "success/failure",
+        "summary": "brief summary of the conversation and key findings"
+    }}
+}}"""
+
+            # Make request to Claude API
+            claude_response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": os.getenv("ANTHROPIC_API_KEY"),
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={
+                    "model": "claude-3-7-sonnet-20250219",
+                    "max_tokens": 64000,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": analysis_prompt
+                        }
+                    ]
+                }
+            )
+            
+            if claude_response.status_code != 200:
+                raise Exception(f"Claude API error: {claude_response.text}")
+            
+            analysis_result = claude_response.json()
+            return json.loads(analysis_result['content'][0]['text'])
+            
+    except Exception as e:
+        app_logger.error(f"Error in transcript analysis: {str(e)}")
+        return {
+            "error": str(e),
+            "analysis": {
+                "criteria_results": [],
+                "overall_assessment": "error",
+                "summary": f"Analysis failed: {str(e)}"
+            }
+        }
+
 @app.get("/conversations/{user_id}")
 async def get_conversation_history(user_id: str):
     """
-    Get conversation history for a user.
+    Get conversation history for a user, including ElevenLabs conversation details with simplified transcript
+    and Claude analysis.
     """
     try:
         app_logger.info(f"Fetching conversations for user: {user_id}")
         conversations = db.get_user_conversations(user_id=user_id)
+        
+        # Fetch additional details from ElevenLabs for each conversation
+        async with httpx.AsyncClient() as client:
+            # Create tasks for all API calls
+            tasks = []
+            for conv in conversations:
+                conv_id = conv['conversation_id']
+                app_logger.info(f"Creating task to fetch ElevenLabs details for conversation: {conv_id}")
+                tasks.append(
+                    client.get(
+                        f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}",
+                        headers={"xi-api-key": ELEVENLABS_API_KEY}
+                    )
+                )
+            
+            # Execute all API calls concurrently
+            app_logger.info(f"Executing {len(tasks)} ElevenLabs API calls concurrently")
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process responses and merge with conversation data
+            for conv, response in zip(conversations, responses):
+                if isinstance(response, Exception):
+                    app_logger.error(f"Error fetching ElevenLabs details for {conv['conversation_id']}: {str(response)}")
+                    conv['elevenlabs_details'] = {"error": str(response)}
+                else:
+                    try:
+                        if response.status_code == 200:
+                            data = response.json()
+                            # Transform transcript to only include role and message
+                            if 'transcript' in data:
+                                simplified_transcript = [
+                                    {
+                                        'role': item['role'],
+                                        'message': item['message']
+                                    }
+                                    for item in data['transcript']
+                                    if item['message'] is not None  # Filter out null messages
+                                ]
+                                data['transcript'] = simplified_transcript
+                                
+                                # Get agent ID from dynamic variables
+                                agent_id = data.get('conversation_initiation_client_data', {}).get('dynamic_variables', {}).get('system__agent_id')
+                                
+                                if agent_id:
+                                    # Perform Claude analysis
+                                    app_logger.info(f"Starting Claude analysis for conversation {conv['conversation_id']}")
+                                    analysis_result = await analyze_transcript_with_claude(
+                                        transcript=simplified_transcript,
+                                        agent_id=agent_id,
+                                        evaluation_criteria=data.get('platform_settings', {}).get('evaluation', {})
+                                    )
+                                    data['claude_analysis'] = analysis_result
+                                    app_logger.info(f"Completed Claude analysis for conversation {conv['conversation_id']}")
+                                else:
+                                    app_logger.warning(f"No agent ID found for conversation {conv['conversation_id']}")
+                                    data['claude_analysis'] = {"error": "No agent ID found"}
+                            
+                            conv['elevenlabs_details'] = data
+                            app_logger.info(f"Successfully processed ElevenLabs details for {conv['conversation_id']}")
+                        else:
+                            app_logger.error(f"ElevenLabs API error for {conv['conversation_id']}: {response.status_code} - {response.text}")
+                            conv['elevenlabs_details'] = {
+                                "error": f"API error: {response.status_code}",
+                                "details": response.text
+                            }
+                    except Exception as e:
+                        app_logger.error(f"Error processing ElevenLabs response for {conv['conversation_id']}: {str(e)}")
+                        conv['elevenlabs_details'] = {"error": str(e)}
+        
         return JSONResponse(
             content={
                 "success": True,
