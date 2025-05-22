@@ -104,28 +104,8 @@ async def initiate_call(request: InitiateCallRequest):
                 conversation_id = f"conv_{user_id}_{int(time.time())}"
             else:
                 app_logger.info(f"Extracted conversation_id from URL: {conversation_id}")
-
-        # Store in database
-        try:
-            db.store_conversation(
-                conversation_id=conversation_id,
-                user_id=user_id,
-                conversation_details={
-                    "status": "initiated",
-                    "agent_id": agent_id,
-                    "first_message": request.first_message,
-                    "started_at": time.time()
-                }
-            )
-            app_logger.info(f"Successfully stored conversation {conversation_id} in database")
-        except Exception as e:
-            app_logger.error(f"Failed to store conversation {conversation_id} in database: {e}")
-            return JSONResponse(
-                content={"error": "Failed to store conversation details"},
-                status_code=500
-            )
         
-        # Store conversation information
+        # Store conversation information in memory only for now
         active_conversations[conversation_id] = {
             "user_id": user_id,
             "agent_id": agent_id,
@@ -133,7 +113,8 @@ async def initiate_call(request: InitiateCallRequest):
             "language": request.language,
             "status": "pending",
             "websocket": None,
-            "signed_url": signed_url
+            "signed_url": signed_url,
+            "needs_db_storage": True  # Flag to indicate this needs to be stored in DB
         }
         
         app_logger.info(f"Created new conversation. ID: {conversation_id}, Status: pending")
@@ -201,8 +182,12 @@ async def trigger_notification(request: NotificationRequest):
             "first_message": request.first_message,  # Store the original first_message
             "system_prompt": request.system_prompt,  # Store the original system_prompt
             "created_at": time.time(),
-            "websocket": None
+            "websocket": None,
+            "needs_db_storage": True  # Flag to indicate this needs to be stored in DB
         }
+        app_logger.info(f"Active conversations after adding new notification: {json.dumps(active_conversations[notification_id], default=str)}")
+        app_logger.info(f"Total active conversations: {len(active_conversations)}")
+        app_logger.info(f"Active conversation IDs: {list(active_conversations.keys())}")
         
         app_logger.info(f"Created new notification. ID: {notification_id}")
         
@@ -256,6 +241,7 @@ async def accept_notification(notification_id: str):
     if notification_id not in active_conversations:
         raise HTTPException(status_code=404, detail="Notification not found")
     
+    app_logger.info(f"Current active conversations: {active_conversations}")
     conversation = active_conversations[notification_id]
     app_logger.info(f"Processing conversation: {conversation}")
     if conversation["status"] != "pending_notification":
@@ -350,33 +336,14 @@ async def websocket_endpoint(websocket: WebSocket, conversation_id: str):
         # Connect to ElevenLabs Conversational AI WebSocket
         async with websockets.connect(signed_url) as elevenlabs_ws:
             app_logger.info("Successfully connected to ElevenLabs WebSocket")
-            
-            # Set up client config with proper format
-            init_config = {
-                "type": "conversation_initiation_client_data",
-                "conversation_config_override": {
-                    "agent": {
-                        "first_message": (
-                            conversation.get("first_message") or 
-                            conversation.get("default_first_message", "Hello! I am your caregiver. How can I help you today?")
-                        ),
-                        "start_conversation_immediately": True,
-                    }
-                }
-            }
-            
-            # Add system prompt if it exists
-            if conversation.get("system_prompt"):
-                init_config["conversation_config_override"]["agent"]["system_prompt"] = conversation["system_prompt"]
-            
-            app_logger.info(f"Sending initialization config to ElevenLabs: {json.dumps(init_config)}")
-            await elevenlabs_ws.send(json.dumps(init_config))
-            
+
             # Handle receiving the initial metadata
             try:
                 metadata_msg = await asyncio.wait_for(elevenlabs_ws.recv(), timeout=5.0)
                 metadata = json.loads(metadata_msg)
                 app_logger.info(f"Received initial metadata from ElevenLabs: {json.dumps(metadata)}")
+                app_logger.info("Sending metadata to client")
+                await websocket.send_json(metadata)
                 
                 if metadata.get("type") == "conversation_initiation_metadata":
                     # Update with the real conversation ID if provided
@@ -389,9 +356,45 @@ async def websocket_endpoint(websocket: WebSocket, conversation_id: str):
                                 active_conversations[real_conversation_id] = active_conversations[conversation_id]
                                 active_conversations.pop(conversation_id, None)
                                 conversation_id = real_conversation_id
-                    
-                    app_logger.info("Sending metadata to client")
-                    await websocket.send_json(metadata)
+                                
+                                # Now store in database with the real conversation ID
+                                if active_conversations[conversation_id].get("needs_db_storage"):
+                                    try:
+                                        db.store_conversation(
+                                            conversation_id=conversation_id,
+                                            user_id=active_conversations[conversation_id]["user_id"],
+                                            conversation_details={
+                                                "status": "active",
+                                                "agent_id": active_conversations[conversation_id]["agent_id"],
+                                                "first_message": active_conversations[conversation_id]["first_message"],
+                                                "started_at": time.time()
+                                            }
+                                        )
+                                        app_logger.info(f"Successfully stored conversation {conversation_id} in database")
+                                        active_conversations[conversation_id]["needs_db_storage"] = False
+                                    except Exception as e:
+                                        app_logger.error(f"Failed to store conversation {conversation_id} in database: {e}")
+                        # Set up client config with proper format
+                        init_config = {
+                            "type": "conversation_initiation_client_data",
+                            "conversation_config_override": {
+                                "agent": {
+                                    "first_message": (
+                                        conversation.get("first_message") or 
+                                        conversation.get("default_first_message", "Hello! I am your caregiver. How can I help you today?")
+                                    ),
+                                    "start_conversation_immediately": True,
+                                }
+                            }
+                        }
+                        
+                        # Add system prompt if it exists
+                        if conversation.get("system_prompt"):
+                            init_config["conversation_config_override"]["agent"]["prompt"] = {}
+                            init_config["conversation_config_override"]["agent"]["prompt"]["prompt"] = conversation["system_prompt"]
+                        
+                        app_logger.info(f"Sending initialization config to ElevenLabs: {json.dumps(init_config)}")
+                        await elevenlabs_ws.send(json.dumps(init_config))
                 else:
                     app_logger.error(f"Unexpected initial message from ElevenLabs: {metadata}")
             except asyncio.TimeoutError:
