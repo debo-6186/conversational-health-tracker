@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, forwardRef, useImperativeHandle } from 'react';
+import React, { useEffect, useRef, forwardRef, useImperativeHandle, useState } from 'react';
 import { notification } from 'antd';
 import { PhoneOutlined } from '@ant-design/icons';
 
@@ -30,6 +30,7 @@ interface NotificationHandlerProps {
 export interface NotificationHandlerRef {
   handleIncomingNotification: (firstMessage?: string, systemPrompt?: string) => Promise<void>;
   testNotification: () => Promise<void>;
+  hasActiveNotification: boolean;
 }
 
 const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandlerProps>(
@@ -38,21 +39,36 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
     const notificationKeyRef = useRef<string | null>(null);
     const notificationIntervalRef = useRef<NodeJS.Timeout | null>(null);
     const notificationWsRef = useRef<WebSocket | null>(null);
+    const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const [hasActiveNotification, setHasActiveNotification] = useState(false);
+    const [isConnecting, setIsConnecting] = useState(false);
 
     // Connect to notification WebSocket
     useEffect(() => {
-      let reconnectTimeout: NodeJS.Timeout;
-      let isConnecting = false;
+      let isComponentMounted = true;
+      let reconnectAttempts = 0;
+      const MAX_RECONNECT_ATTEMPTS = 5;
+      const RECONNECT_DELAY = 5000;
 
       const connectNotificationWebSocket = async () => {
-        if (isConnecting) {
-          log.info('Already attempting to connect, skipping...');
+        if (!isComponentMounted) {
+          log.info('Component unmounted, skipping connection');
           return;
         }
 
-        isConnecting = true;
+        if (isConnecting || (notificationWsRef.current && notificationWsRef.current.readyState === WebSocket.OPEN)) {
+          log.info('Already connected or connecting, skipping...');
+          return;
+        }
+
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+          log.error('Max reconnection attempts reached');
+          return;
+        }
+
+        setIsConnecting(true);
         const wsUrl = `${serverUrl.replace('http', 'ws')}/ws/notifications/${userId}`;
-        log.info(`Connecting to notification WebSocket: ${wsUrl}`);
+        log.info(`Connecting to notification WebSocket: ${wsUrl} (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})`);
 
         try {
           // First check if server is available
@@ -65,75 +81,136 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
 
           // Close existing connection if any
           if (notificationWsRef.current) {
-            notificationWsRef.current.close();
+            log.info('Closing existing WebSocket connection');
+            notificationWsRef.current.close(1000, 'Reconnecting');
             notificationWsRef.current = null;
           }
 
+          log.info('Creating new WebSocket connection');
           const ws = new WebSocket(wsUrl);
           notificationWsRef.current = ws;
 
           ws.onopen = () => {
-            log.info('Notification WebSocket connected');
-            isConnecting = false;
+            if (!isComponentMounted) {
+              ws.close(1000, 'Component unmounted');
+              return;
+            }
+            log.info('Notification WebSocket connected successfully');
+            setIsConnecting(false);
+            reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+            
             // Send a test message
-            ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+            const pingMessage = { type: 'ping', timestamp: Date.now() };
+            log.info('Sending ping message:', pingMessage);
+            ws.send(JSON.stringify(pingMessage));
           };
 
           ws.onmessage = (event) => {
+            if (!isComponentMounted) return;
+            
             try {
+              log.info('Raw WebSocket message received:', event.data);
               const data = JSON.parse(event.data);
-              log.info('Received message from server:', data);
+              log.info('Parsed WebSocket message:', data);
               
               if (data.type === 'connection_established') {
                 log.info('Connection established message received:', data.message);
               } else if (data.type === 'notification') {
+                log.info('Received notification message:', {
+                  notification_id: data.notification_id,
+                  title: data.title,
+                  body: data.body,
+                  first_message: data.first_message,
+                  system_prompt: data.system_prompt
+                });
+
+                // Ensure all required fields are present
+                if (!data.notification_id || !data.title || !data.body) {
+                  log.error('Invalid notification data:', data);
+                  return;
+                }
+
+                // Call showNotification with the notification data
                 showNotification(
-                  data.notification_id, 
-                  data.title, 
+                  data.notification_id,
+                  data.title,
                   data.body,
-                  data.first_message,  // Pass first_message from notification
-                  data.system_prompt   // Pass system_prompt from notification
+                  data.first_message,
+                  data.system_prompt
                 );
+              } else {
+                log.info('Received other message type:', data.type);
               }
             } catch (error) {
               log.error('Error processing WebSocket message:', error);
+              log.error('Raw message that caused error:', event.data);
             }
           };
 
           ws.onclose = (event) => {
+            if (!isComponentMounted) return;
+            
             log.info(`Notification WebSocket closed (code: ${event.code}, reason: ${event.reason})`);
-            isConnecting = false;
+            setIsConnecting(false);
             notificationWsRef.current = null;
             
-            // Attempt to reconnect after a delay
-            if (event.code !== 1000) { // Don't reconnect if closed normally
-              log.info('Scheduling reconnection...');
-              reconnectTimeout = setTimeout(connectNotificationWebSocket, 5000);
+            // Attempt to reconnect after a delay if not closed normally
+            if (event.code !== 1000 && isComponentMounted) {
+              reconnectAttempts++;
+              log.info(`Scheduling reconnection attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${RECONNECT_DELAY/1000} seconds...`);
+              if (reconnectTimeoutRef.current) {
+                clearTimeout(reconnectTimeoutRef.current);
+              }
+              reconnectTimeoutRef.current = setTimeout(() => {
+                if (isComponentMounted) {
+                  log.info('Attempting to reconnect WebSocket...');
+                  connectNotificationWebSocket();
+                }
+              }, RECONNECT_DELAY);
             }
           };
 
           ws.onerror = (error) => {
+            if (!isComponentMounted) return;
+            
             log.error('Notification WebSocket error:', error);
-            // Log additional connection details
             log.info('WebSocket state:', ws.readyState);
             log.info('WebSocket URL:', ws.url);
-            isConnecting = false;
+            setIsConnecting(false);
           };
         } catch (error) {
+          if (!isComponentMounted) return;
+          
           log.error('Error setting up WebSocket connection:', error);
-          isConnecting = false;
+          setIsConnecting(false);
+          
           // Attempt to reconnect after a delay
-          reconnectTimeout = setTimeout(connectNotificationWebSocket, 5000);
+          reconnectAttempts++;
+          if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS && isComponentMounted) {
+            log.info(`Scheduling reconnection attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} after error in ${RECONNECT_DELAY/1000} seconds...`);
+            if (reconnectTimeoutRef.current) {
+              clearTimeout(reconnectTimeoutRef.current);
+            }
+            reconnectTimeoutRef.current = setTimeout(() => {
+              if (isComponentMounted) {
+                log.info('Attempting to reconnect WebSocket after error...');
+                connectNotificationWebSocket();
+              }
+            }, RECONNECT_DELAY);
+          }
         }
       };
 
       // Initial connection
+      log.info('Setting up initial WebSocket connection');
       connectNotificationWebSocket();
 
       // Cleanup on unmount
       return () => {
-        if (reconnectTimeout) {
-          clearTimeout(reconnectTimeout);
+        log.info('Cleaning up WebSocket connection');
+        isComponentMounted = false;
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
         }
         if (notificationWsRef.current) {
           notificationWsRef.current.close(1000, 'Component unmounting');
@@ -189,55 +266,64 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
     };
 
     const showNotification = async (notificationId: string, title: string, body: string, firstMessage?: string, systemPrompt?: string) => {
+      log.info('showNotification called with:', { notificationId, title, body, firstMessage, systemPrompt });
+      
       // Stop any existing notification
       if (notificationKeyRef.current) {
+        log.info('Destroying existing notification:', notificationKeyRef.current);
         notification.destroy(notificationKeyRef.current);
       }
       if (notificationIntervalRef.current) {
+        log.info('Clearing existing notification interval');
         clearInterval(notificationIntervalRef.current);
       }
       stopNotificationSound();
 
       // Start playing notification sound
+      log.info('Playing notification sound');
       playNotificationSound();
+      setHasActiveNotification(true);
 
       // Show notification
       const key = `notification-${notificationId}`;
       notificationKeyRef.current = key;
+      log.info('Creating new notification with key:', key);
 
       notification.open({
         key,
         message: title,
         description: body,
         icon: <PhoneOutlined style={{ color: '#108ee9' }} />,
-        duration: 0, // Notification stays until manually closed
+        duration: 0,
         btn: (
           <button
             onClick={async () => {
               try {
-                // Accept the notification and get conversation ID
+                log.info('Accepting notification:', notificationId);
                 const response = await fetch(`${serverUrl}/accept-notification/${notificationId}`, {
                   method: 'POST',
                 });
                 
                 const data = await response.json();
+                log.info('Accept notification response:', data);
+                
                 if (!data.success) {
                   throw new Error(data.error || 'Failed to accept notification');
                 }
 
-                // Stop notification sound and clear notification
+                log.info('Notification accepted successfully:', data);
                 stopNotificationSound();
                 if (notificationIntervalRef.current) {
                   clearInterval(notificationIntervalRef.current);
                 }
                 notification.destroy(key);
                 notificationKeyRef.current = null;
+                setHasActiveNotification(false);
 
-                // Pass the first_message and system_prompt to onCallAccepted
                 onCallAccepted(
                   data.conversation_id,
-                  firstMessage || data.first_message,  // Use notification data first, then fallback to server response
-                  systemPrompt || data.system_prompt    // Use notification data first, then fallback to server response
+                  firstMessage || data.first_message,
+                  systemPrompt || data.system_prompt
                 );
               } catch (error) {
                 log.error('Error accepting notification:', error);
@@ -264,6 +350,7 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
       // Set up interval to keep showing notification if it's closed
       notificationIntervalRef.current = setInterval(() => {
         if (!document.querySelector(`.ant-notification-notice-${key}`)) {
+          log.info('Notification closed, showing again');
           showNotification(notificationId, title, body, firstMessage, systemPrompt);
         }
       }, 1000);
@@ -340,10 +427,11 @@ const NotificationHandler = forwardRef<NotificationHandlerRef, NotificationHandl
       }
     };
 
-    // Expose both handler functions to parent component
+    // Expose both handler functions and state to parent component
     useImperativeHandle(ref, () => ({
       handleIncomingNotification,
-      testNotification, // Expose test function
+      testNotification,
+      hasActiveNotification,
     }));
 
     return null; // This component doesn't render anything
