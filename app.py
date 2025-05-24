@@ -147,100 +147,155 @@ async def analyze_transcript_with_claude(transcript: list, agent_id: str, evalua
     Returns:
         dict: Analysis results from Claude
     """
-    try:
-        # First get agent details
-        async with httpx.AsyncClient() as client:
-            agent_response = await client.get(
-                f"https://api.elevenlabs.io/v1/convai/agents/{agent_id}",
-                headers={"xi-api-key": ELEVENLABS_API_KEY}
-            )
-            
-            if agent_response.status_code != 200:
-                raise Exception(f"Failed to get agent details: {agent_response.text}")
-            
-            agent_data = agent_response.json()
-            
-            # Extract evaluation criteria from platform settings
-            criteria = agent_data.get('platform_settings', {}).get('evaluation', {}).get('criteria', [])
-            
-            # Prepare the prompt for Claude
-            criteria_prompts = "\n".join([
-                f"- {c.get('name')}: {c.get('conversation_goal_prompt')}"
-                for c in criteria
-            ])
-            
-            # Format transcript for analysis
-            formatted_transcript = "\n".join([
-                f"{turn['role'].upper()}: {turn['message']}"
-                for turn in transcript
-            ])
-            
-            # Prepare the analysis request to Claude
-            analysis_prompt = f"""You are an expert conversation analyst. Analyze the following conversation between a user and an AI agent (ID: {agent_id}).
+    max_retries = 3
+    retry_delay = 2  # seconds
+    timeout = httpx.Timeout(30.0, read=60.0)  # 30s connect timeout, 60s read timeout
+    
+    for attempt in range(max_retries):
+        try:
+            # First get agent details
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                agent_response = await client.get(
+                    f"https://api.elevenlabs.io/v1/convai/agents/{agent_id}",
+                    headers={"xi-api-key": ELEVENLABS_API_KEY}
+                )
+                
+                if agent_response.status_code != 200:
+                    raise Exception(f"Failed to get agent details: {agent_response.text}")
+                
+                agent_data = agent_response.json()
+                app_logger.info(f"Retrieved agent data: {agent_data}")
+                
+                # Extract evaluation criteria from platform settings
+                criteria = agent_data.get('platform_settings', {}).get('evaluation', {}).get('criteria', [])
+                
+                # Extract data collection criteria
+                data_collection = agent_data.get('platform_settings', {}).get('data_collection', {})
+                
+                # Prepare the prompt for Claude
+                criteria_prompts = "\n".join([
+                    f"# {c.get('name')} #: {c.get('conversation_goal_prompt')}"
+                    for c in criteria
+                ])
+                
+                # Prepare data collection prompts
+                data_collection_prompts = "\n".join([
+                    f"# Data Collection - {name} #: {details.get('description')}"
+                    for name, details in data_collection.items()
+                ])
+                
+                app_logger.info(f"Evaluation criteria prompts:\n{criteria_prompts}")
+                app_logger.info(f"Data collection prompts:\n{data_collection_prompts}")
+                
+                # Format transcript for analysis
+                formatted_transcript = "\n".join([
+                    f"{turn['role'].upper()}: {turn['message']}"
+                    for turn in transcript
+                ])
+                
+                # Prepare the analysis request to Claude
+                analysis_prompt = f"""Analyze this conversation between a user and AI agent (ID: {agent_id}).
 
-Evaluation Criteria:
+Criteria:
 {criteria_prompts}
 
-Conversation Transcript:
+Data Collection:
+{data_collection_prompts}
+
+Transcript:
 {formatted_transcript}
 
-Please analyze this conversation based on the evaluation criteria above. For each criterion:
-1. Determine if the goal was met (success/failure)
-2. Provide a clear rationale for your assessment
-3. Note any specific examples from the conversation that support your assessment
+Analyze based on criteria and data collection above. For each:
+1. Success/failure
+2. Rationale
+3. Supporting evidence
+4. For data collection: identify collected data
 
-Format your response as a JSON object with the following structure:
+IMPORTANT: Return ONLY the raw JSON object without any markdown formatting or code blocks. Do not include ```json or ``` markers.
+
+Return this exact JSON structure:
 {{
     "analysis": {{
         "criteria_results": [
             {{
-                "criterion_name": "name of criterion",
+                "criterion_name": "name",
                 "result": "success/failure",
-                "rationale": "detailed explanation",
-                "supporting_evidence": ["specific examples from conversation"]
+                "rationale": "explanation",
+                "supporting_evidence": ["examples"]
+            }}
+        ],
+        "data_collection_results": [
+            {{
+                "data_type": "name",
+                "collected": true/false,
+                "value": "value if any",
+                "rationale": "explanation"
             }}
         ],
         "overall_assessment": "success/failure",
-        "summary": "brief summary of the conversation and key findings"
+        "summary": "brief summary"
     }}
 }}"""
 
-            # Make request to Claude API
-            claude_response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": os.getenv("ANTHROPIC_API_KEY"),
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                },
-                json={
-                    "model": "claude-3-7-sonnet-20250219",
-                    "max_tokens": 64000,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": analysis_prompt
-                        }
-                    ]
+                app_logger.info(f"Analysis prompt for Claude (attempt {attempt + 1}/{max_retries})")
+                
+                # Make request to Claude API with timeout
+                claude_response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": os.getenv("ANTHROPIC_API_KEY"),
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json"
+                    },
+                    json={
+                        "model": "claude-3-7-sonnet-20250219",
+                        "max_tokens": 4000,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": analysis_prompt
+                            }
+                        ]
+                    }
+                )
+                
+                if claude_response.status_code != 200:
+                    raise Exception(f"Claude API error: {claude_response.text}")
+                
+                app_logger.info(f"Claude API response: {claude_response.text}")
+                analysis_result = claude_response.json()
+                return json.loads(analysis_result['content'][0]['text'])
+                
+        except httpx.ReadTimeout as e:
+            error_msg = f"Timeout error on attempt {attempt + 1}/{max_retries}: {str(e)}"
+            app_logger.warning(error_msg)
+            if attempt < max_retries - 1:
+                app_logger.info(f"Retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                continue
+            else:
+                app_logger.error(error_msg, exc_info=True)
+                return {
+                    "error": error_msg,
+                    "analysis": {
+                        "criteria_results": [],
+                        "data_collection_results": [],
+                        "overall_assessment": "error",
+                        "summary": f"Analysis failed after {max_retries} attempts: {error_msg}"
+                    }
                 }
-            )
-            
-            if claude_response.status_code != 200:
-                raise Exception(f"Claude API error: {claude_response.text}")
-            
-            analysis_result = claude_response.json()
-            return json.loads(analysis_result['content'][0]['text'])
-            
-    except Exception as e:
-        app_logger.error(f"Error in transcript analysis: {str(e)}")
-        return {
-            "error": str(e),
-            "analysis": {
-                "criteria_results": [],
-                "overall_assessment": "error",
-                "summary": f"Analysis failed: {str(e)}"
+        except Exception as e:
+            error_msg = str(e)
+            app_logger.error(f"Error in transcript analysis: {error_msg}", exc_info=True)
+            return {
+                "error": error_msg,
+                "analysis": {
+                    "criteria_results": [],
+                    "data_collection_results": [],
+                    "overall_assessment": "error",
+                    "summary": f"Analysis failed: {error_msg}"
+                }
             }
-        }
 
 @app.get("/conversations/{user_id}")
 async def get_conversation_history(user_id: str):
